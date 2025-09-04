@@ -1,0 +1,477 @@
+name: Ollama Server with Static ngrok Domain
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: 'Job ID for tracking'
+        required: false
+        default: ''
+      callback_url:
+        description: 'Callback URL for status updates'
+        required: false
+        default: ''
+      kv_namespace_id:
+        description: 'Cloudflare KV Namespace ID'
+        required: false
+        default: ''
+      ngrok_domain:
+        description: 'Static ngrok domain (e.g., your-domain.ngrok-free.app)'
+        required: false
+        default: ''
+
+env:
+  OLLAMA_HOST: 0.0.0.0:11543
+  NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
+  NGROK_STATIC_DOMAIN: ${{ github.event.inputs.ngrok_domain || secrets.NGROK_STATIC_DOMAIN }}
+  CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+  CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+  N8N_WEBHOOK_URL: ${{ secrets.N8N_WEBHOOK_URL }}
+  GH_PAT_TOKEN: ${{ secrets.GH_PAT_TOKEN }}
+
+jobs:
+  ollama-server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # 6 hours max
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate ngrok domain
+        run: |
+          if [ -z "$NGROK_STATIC_DOMAIN" ]; then
+            echo "Error: Static ngrok domain is required. Please set NGROK_STATIC_DOMAIN secret or provide ngrok_domain input."
+            exit 1
+          fi
+          echo "Using static ngrok domain: $NGROK_STATIC_DOMAIN"
+
+      - name: Generate Job ID
+        id: generate-job-id
+        run: |
+          if [ -z "${{ github.event.inputs.job_id }}" ]; then
+            JOB_ID="job-$(date +%s)-${{ github.run_id }}"
+          else
+            JOB_ID="${{ github.event.inputs.job_id }}"
+          fi
+          echo "job_id=$JOB_ID" >> $GITHUB_OUTPUT
+          echo "Job ID: $JOB_ID"
+
+      - name: Set static URLs
+        id: set-urls
+        run: |
+          # Set the static URLs based on the domain
+          STATIC_URL="https://$NGROK_STATIC_DOMAIN"
+          OLLAMA_ENDPOINT="$STATIC_URL/api/generate"
+          OLLAMA_TAGS_ENDPOINT="$STATIC_URL/api/tags"
+          OLLAMA_CHAT_ENDPOINT="$STATIC_URL/api/chat"
+          
+          echo "static_url=$STATIC_URL" >> $GITHUB_OUTPUT
+          echo "ollama_endpoint=$OLLAMA_ENDPOINT" >> $GITHUB_OUTPUT
+          echo "ollama_tags_endpoint=$OLLAMA_TAGS_ENDPOINT" >> $GITHUB_OUTPUT
+          echo "ollama_chat_endpoint=$OLLAMA_CHAT_ENDPOINT" >> $GITHUB_OUTPUT
+          
+          echo "Static URL: $STATIC_URL"
+          echo "Ollama Endpoint: $OLLAMA_ENDPOINT"
+
+      - name: Update status to starting
+        run: |
+          # Send initial status to Cloudflare KV
+          curl -X PUT "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces/${{ github.event.inputs.kv_namespace_id || secrets.KV_NAMESPACE_ID }}/values/${{ steps.generate-job-id.outputs.job_id }}" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data '{
+              "status": "starting",
+              "job_id": "${{ steps.generate-job-id.outputs.job_id }}",
+              "static_url": "${{ steps.set-urls.outputs.static_url }}",
+              "ollama_endpoint": "${{ steps.set-urls.outputs.ollama_endpoint }}",
+              "started_at": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'",
+              "run_id": "${{ github.run_id }}",
+              "run_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }' || true
+
+          # Send webhook to n8n
+          if [ ! -z "$N8N_WEBHOOK_URL" ]; then
+            curl -X POST "$N8N_WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -d '{
+                "status": "starting",
+                "job_id": "${{ steps.generate-job-id.outputs.job_id }}",
+                "static_url": "${{ steps.set-urls.outputs.static_url }}",
+                "run_id": "${{ github.run_id }}"
+              }' || true
+          fi
+
+      - name: Cache Ollama installation
+        id: cache-ollama
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.ollama
+            /usr/local/bin/ollama
+          key: ${{ runner.os }}-ollama-${{ hashFiles('**/ollama-version.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-ollama-
+
+      - name: Install or Update Ollama
+        run: |
+          # Kill any existing Ollama processes
+          sudo pkill ollama || true
+          sleep 2
+          
+          if [ ! -f /usr/local/bin/ollama ]; then
+            echo "Installing Ollama..."
+            curl -fsSL https://ollama.ai/install.sh | sh
+          else
+            echo "Ollama already installed from cache"
+          fi
+          
+          # Verify installation
+          ollama --version
+
+      - name: Start Ollama server
+        run: |
+          # Kill any existing process and start fresh
+          sudo pkill ollama || true
+          sleep 2
+          
+          # Start Ollama with custom host
+          OLLAMA_HOST=$OLLAMA_HOST nohup ollama serve > ollama.log 2>&1 &
+          echo $! > ollama.pid
+          
+          # Wait for server to be ready
+          for i in {1..30}; do
+            if curl -s http://0.0.0.0:11543/api/tags >/dev/null 2>&1; then
+              echo "Ollama server is ready"
+              break
+            fi
+            echo "Waiting for Ollama server... ($i/30)"
+            sleep 2
+          done
+          
+          if ! curl -s http://0.0.0.0:11543/api/tags >/dev/null 2>&1; then
+            echo "Failed to start Ollama server"
+            cat ollama.log
+            exit 1
+          fi
+
+      - name: Install ngrok
+        run: |
+          # Download and install ngrok
+          curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | \
+            sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null && \
+            echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | \
+            sudo tee /etc/apt/sources.list.d/ngrok.list && \
+            sudo apt update && \
+            sudo apt install ngrok
+          
+          # Configure ngrok auth token
+          ngrok config add-authtoken $NGROK_AUTH_TOKEN
+
+      - name: Start ngrok tunnel with static domain
+        id: start-tunnel
+        run: |
+          # Start ngrok tunnel with static domain
+          echo "Starting ngrok tunnel with static domain: $NGROK_STATIC_DOMAIN"
+          nohup ngrok http 11543 --domain=$NGROK_STATIC_DOMAIN --log=stdout > ngrok.log 2>&1 &
+          echo $! > ngrok.pid
+          
+          # Wait for ngrok to establish tunnel
+          sleep 15
+          
+          # Verify tunnel is established
+          TUNNEL_CHECK=0
+          for i in {1..10}; do
+            if curl -s http://localhost:4040/api/tunnels | jq -e '.tunnels[0].public_url' >/dev/null 2>&1; then
+              TUNNEL_URL=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[0].public_url')
+              echo "Tunnel established: $TUNNEL_URL"
+              TUNNEL_CHECK=1
+              break
+            fi
+            echo "Waiting for tunnel... ($i/10)"
+            sleep 3
+          done
+          
+          if [ $TUNNEL_CHECK -eq 0 ]; then
+            echo "Failed to establish ngrok tunnel"
+            echo "Ngrok logs:"
+            cat ngrok.log
+            exit 1
+          fi
+          
+          # Test the tunnel
+          echo "Testing tunnel connectivity..."
+          sleep 5
+          if curl -s "${{ steps.set-urls.outputs.ollama_tags_endpoint }}" >/dev/null 2>&1; then
+            echo "Tunnel is working correctly"
+          else
+            echo "Warning: Tunnel may not be fully ready yet"
+          fi
+
+      - name: Pull Ollama models
+        run: |
+          echo "Pulling Ollama models..."
+          
+          # Try to pull models in order of preference
+          MODEL_PULLED=false
+          
+          for model in "llama3.2:latest" "llama3:latest" "llama2:latest" "mistral:latest" "phi3:latest"; do
+            echo "Attempting to pull $model..."
+            if OLLAMA_HOST=$OLLAMA_HOST timeout 300 ollama pull $model; then
+              echo "Successfully pulled $model"
+              MODEL_PULLED=true
+              break
+            else
+              echo "Failed to pull $model, trying next..."
+            fi
+          done
+          
+          if [ "$MODEL_PULLED" = false ]; then
+            echo "Failed to pull any models, but continuing..."
+          fi
+          
+          # List available models
+          echo "Available models:"
+          OLLAMA_HOST=$OLLAMA_HOST ollama list || true
+
+      - name: Update status to running
+        run: |
+          # Get list of available models
+          MODELS=$(OLLAMA_HOST=$OLLAMA_HOST ollama list | tail -n +2 | awk '{print $1}' | grep -v "^$" | jq -R . | jq -s . || echo '[]')
+          
+          # Update Cloudflare KV with running status
+          curl -X PUT "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces/${{ github.event.inputs.kv_namespace_id || secrets.KV_NAMESPACE_ID }}/values/${{ steps.generate-job-id.outputs.job_id }}" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data '{
+              "status": "running",
+              "job_id": "${{ steps.generate-job-id.outputs.job_id }}",
+              "static_url": "${{ steps.set-urls.outputs.static_url }}",
+              "ollama_endpoint": "${{ steps.set-urls.outputs.ollama_endpoint }}",
+              "ollama_tags_endpoint": "${{ steps.set-urls.outputs.ollama_tags_endpoint }}",
+              "ollama_chat_endpoint": "${{ steps.set-urls.outputs.ollama_chat_endpoint }}",
+              "models_available": '$MODELS',
+              "tunnel_ready": true,
+              "started_at": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'",
+              "run_id": "${{ github.run_id }}"
+            }' || true
+          
+          # Send update to n8n
+          if [ ! -z "$N8N_WEBHOOK_URL" ]; then
+            curl -X POST "$N8N_WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -d '{
+                "status": "running",
+                "job_id": "${{ steps.generate-job-id.outputs.job_id }}",
+                "static_url": "${{ steps.set-urls.outputs.static_url }}",
+                "ollama_endpoint": "${{ steps.set-urls.outputs.ollama_endpoint }}"
+              }' || true
+          fi
+
+      - name: Keep alive and monitor
+        run: |
+          # Calculate end time (4 hours 5 minutes from now)
+          END_TIME=$(($(date +%s) + 14700))  # 4h 5min = 14700 seconds
+          KEEP_ALIVE_INTERVAL=300  # 5 minutes
+          HEALTH_CHECK_INTERVAL=60  # 1 minute
+          LAST_KEEP_ALIVE=$(date +%s)
+          LAST_HEALTH_CHECK=$(date +%s)
+          
+          echo "Starting monitoring loop until $(date -d @$END_TIME)"
+          echo "Static URL: ${{ steps.set-urls.outputs.static_url }}"
+          
+          while [ $(date +%s) -lt $END_TIME ]; do
+            CURRENT_TIME=$(date +%s)
+            
+            # Health check every minute
+            if [ $((CURRENT_TIME - LAST_HEALTH_CHECK)) -ge $HEALTH_CHECK_INTERVAL ]; then
+              # Check Ollama server locally
+              if ! curl -s http://0.0.0.0:11543/api/tags >/dev/null 2>&1; then
+                echo "$(date): Ollama server down, restarting..."
+                sudo pkill ollama || true
+                sleep 2
+                OLLAMA_HOST=$OLLAMA_HOST nohup ollama serve > ollama.log 2>&1 &
+                echo $! > ollama.pid
+                sleep 10
+              fi
+              
+              # Check ngrok tunnel
+              if ! curl -s http://localhost:4040/api/tunnels | jq -e '.tunnels[0].public_url' >/dev/null 2>&1; then
+                echo "$(date): ngrok tunnel down, restarting..."
+                pkill ngrok || true
+                sleep 2
+                nohup ngrok http 11543 --domain=$NGROK_STATIC_DOMAIN --log=stdout > ngrok.log 2>&1 &
+                echo $! > ngrok.pid
+                sleep 15
+              fi
+              
+              # Test external connectivity
+              if ! curl -s --connect-timeout 10 "${{ steps.set-urls.outputs.ollama_tags_endpoint }}" >/dev/null 2>&1; then
+                echo "$(date): Warning: External connectivity test failed"
+              fi
+              
+              LAST_HEALTH_CHECK=$CURRENT_TIME
+            fi
+            
+            # Keep alive update every 5 minutes
+            if [ $((CURRENT_TIME - LAST_KEEP_ALIVE)) -ge $KEEP_ALIVE_INTERVAL ]; then
+              echo "$(date): Keep-alive update"
+              
+              # Update keep-alive timestamp in KV
+              curl -X PUT "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces/${{ github.event.inputs.kv_namespace_id || secrets.KV_NAMESPACE_ID }}/values/${{ steps.generate-job-id.outputs.job_id }}-keepalive" \
+                -H "Authorization: Bearer $CF_API_TOKEN" \
+                -H "Content-Type: text/plain" \
+                --data "$(date -u +%Y-%m-%dT%H:%M:%SZ)" || true
+              
+              # Send periodic webhook
+              if [ ! -z "$N8N_WEBHOOK_URL" ]; then
+                curl -X POST "$N8N_WEBHOOK_URL" \
+                  -H "Content-Type: application/json" \
+                  -d '{
+                    "status": "heartbeat",
+                    "job_id": "${{ steps.generate-job-id.outputs.job_id }}",
+                    "timestamp": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"
+                  }' || true
+              fi
+              
+              LAST_KEEP_ALIVE=$CURRENT_TIME
+            fi
+            
+            # Calculate and display remaining time every 10 minutes
+            REMAINING=$((END_TIME - CURRENT_TIME))
+            if [ $((REMAINING % 600)) -eq 0 ]; then
+              echo "$(date): Remaining time: $((REMAINING / 60)) minutes"
+            fi
+            
+            sleep 30
+          done
+          
+          echo "$(date): Runtime complete, preparing to trigger next run..."
+
+      - name: Trigger next workflow run
+        if: always()
+        run: |
+          echo "Triggering next workflow run..."
+          
+          # Generate next job ID
+          NEXT_JOB_ID="job-$(date +%s)-next"
+          
+          # Trigger next run using GitHub API
+          curl -X POST \
+            -H "Authorization: token $GH_PAT_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/${{ github.workflow }}/dispatches" \
+            -d '{
+              "ref": "${{ github.ref }}",
+              "inputs": {
+                "job_id": "'$NEXT_JOB_ID'",
+                "kv_namespace_id": "${{ github.event.inputs.kv_namespace_id || secrets.KV_NAMESPACE_ID }}",
+                "ngrok_domain": "'$NGROK_STATIC_DOMAIN'"
+              }
+            }' || echo "Failed to trigger next run"
+          
+          echo "Next run triggered with job ID: $NEXT_JOB_ID"
+
+      - name: Final status update
+        if: always()
+        run: |
+          # Determine final status
+          if [ "${{ job.status }}" == "success" ]; then
+            STATUS="completed"
+          elif [ "${{ job.status }}" == "cancelled" ]; then
+            STATUS="cancelled"
+          else
+            STATUS="failed"
+          fi
+          
+          echo "Final status: $STATUS"
+          
+          # Update final status in KV
+          curl -X PUT "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces/${{ github.event.inputs.kv_namespace_id || secrets.KV_NAMESPACE_ID }}/values/${{ steps.generate-job-id.outputs.job_id }}" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data '{
+              "status": "'$STATUS'",
+              "job_id": "${{ steps.generate-job-id.outputs.job_id }}",
+              "static_url": "${{ steps.set-urls.outputs.static_url }}",
+              "completed_at": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'",
+              "run_id": "${{ github.run_id }}",
+              "next_run_triggered": true
+            }' || true
+          
+          # Send final webhook
+          if [ ! -z "$N8N_WEBHOOK_URL" ]; then
+            curl -X POST "$N8N_WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -d '{
+                "status": "'$STATUS'",
+                "job_id": "${{ steps.generate-job-id.outputs.job_id }}",
+                "static_url": "${{ steps.set-urls.outputs.static_url }}",
+                "completed_at": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"
+              }' || true
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: |
+          echo "Starting cleanup process..."
+          
+          # Kill processes gracefully
+          if [ -f ollama.pid ]; then
+            PID=$(cat ollama.pid)
+            if kill -0 $PID 2>/dev/null; then
+              echo "Stopping Ollama (PID: $PID)"
+              kill $PID || true
+              sleep 2
+              kill -9 $PID 2>/dev/null || true
+            fi
+          fi
+          
+          if [ -f ngrok.pid ]; then
+            PID=$(cat ngrok.pid)
+            if kill -0 $PID 2>/dev/null; then
+              echo "Stopping ngrok (PID: $PID)"
+              kill $PID || true
+              sleep 2
+              kill -9 $PID 2>/dev/null || true
+            fi
+          fi
+          
+          # Cleanup any remaining processes
+          sudo pkill ollama || true
+          pkill ngrok || true
+          
+          # Create combined log file
+          echo "=== Combined Logs ===" > combined.log
+          echo "Generated at: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> combined.log
+          echo "" >> combined.log
+          
+          if [ -f ollama.log ]; then
+            echo "=== Ollama Server Logs ===" >> combined.log
+            cat ollama.log >> combined.log
+            echo "" >> combined.log
+          fi
+          
+          if [ -f ngrok.log ]; then
+            echo "=== Ngrok Tunnel Logs ===" >> combined.log
+            cat ngrok.log >> combined.log
+            echo "" >> combined.log
+          fi
+          
+          # Log system info
+          echo "=== System Information ===" >> combined.log
+          echo "Runner: ${{ runner.os }}" >> combined.log
+          echo "Job ID: ${{ steps.generate-job-id.outputs.job_id }}" >> combined.log
+          echo "Static Domain: $NGROK_STATIC_DOMAIN" >> combined.log
+          echo "Run ID: ${{ github.run_id }}" >> combined.log
+          echo "Cleanup completed at: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> combined.log
+
+      - name: Upload logs and artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-logs-${{ steps.generate-job-id.outputs.job_id }}
+          path: |
+            *.log
+            *.pid
+          retention-days: 7
