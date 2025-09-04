@@ -27,7 +27,7 @@ env:
   CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
   CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
   N8N_WEBHOOK_URL: ${{ secrets.N8N_WEBHOOK_URL }}
-  GH_PAT_TOKEN: ${{ secrets.GH_PAT_TOKEN }}
+  GGITHUB_TOKEN: ${{ secrets.GGITHUB_TOKEN }}
 
 jobs:
   ollama-server:
@@ -351,26 +351,18 @@ jobs:
       - name: Trigger next workflow run
         if: always()
         run: |
-          echo "Triggering next workflow run..."
+          echo "🔄 Triggering next workflow run..."
           
-          # Generate next job ID
-          NEXT_JOB_ID="job-$(date +%s)-next"
-          
-          # Trigger next run using GitHub API
+          # Trigger workflow via GitHub API
           curl -X POST \
-            -H "Authorization: token $GH_PAT_TOKEN" \
-            -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/${{ github.workflow }}/dispatches" \
-            -d '{
-              "ref": "${{ github.ref }}",
-              "inputs": {
-                "job_id": "'$NEXT_JOB_ID'",
-                "kv_namespace_id": "${{ github.event.inputs.kv_namespace_id || secrets.KV_NAMESPACE_ID }}",
-                "ngrok_domain": "'$NGROK_STATIC_DOMAIN'"
-              }
-            }' || echo "Failed to trigger next run"
+            -H "Authorization: Bearer ${{ secrets.GGITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/main.yml/dispatches \
+            -d '{"ref":"${{ github.ref_name }}", "inputs":{"restart_reason":"auto_restart_after_'${{ env.RUNTIME_HOURS }}'h"}}' \
+            || echo "⚠️  Failed to trigger next run - manual restart may be needed"
           
-          echo "Next run triggered with job ID: $NEXT_JOB_ID"
+          echo "✅ Next workflow triggered successfully"
 
       - name: Final status update
         if: always()
